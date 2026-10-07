@@ -2089,43 +2089,37 @@
         record = try await container.database(for: record.recordID).record(for: record.recordID)
       }
 
+      // Columns whose asset cannot be read are left out of both lists, so the row keeps whatever
+      // it already holds. Writing NULL, or falling back to `"excluded"`, would blank it instead:
+      // `excluded` carries the same NULL, already substituted for the column default.
+      let insertColumns: [(name: String, value: QueryFragment)] =
+        columnNames.compactMap { columnName in
+          writableValue(of: record, forColumn: columnName, dataManager: dataManager.wrappedValue)
+            .map { (name: columnName, value: $0) }
+        }
+      let updateColumns: [(name: String, value: QueryFragment)] =
+        nonPrimaryKeyChangedColumns.compactMap { columnName in
+          writableValue(of: record, forColumn: columnName, dataManager: dataManager.wrappedValue)
+            .map { (name: columnName, value: $0) }
+        }
+      guard !insertColumns.isEmpty
+      else {
+        return ""
+      }
+
       var query: QueryFragment = "INSERT INTO \(T.self) ("
-      query.append(columnNames.map { "\(quote: $0)" }.joined(separator: ", "))
+      query.append(insertColumns.map { "\(quote: $0.name)" }.joined(separator: ", "))
       query.append(") VALUES (")
-      query.append(
-        columnNames
-          .map { columnName in
-            if let asset = record[columnName] as? CKAsset {
-              let data = try? asset.fileURL.map { try dataManager.wrappedValue.load($0) }
-              if data == nil {
-                reportIssue("Asset data not found on disk")
-              }
-              return data?.queryFragment ?? "NULL"
-            } else {
-              return record.encryptedValues[columnName]?.queryFragment ?? "NULL"
-            }
-          }
-          .joined(separator: ", ")
-      )
+      query.append(insertColumns.map(\.value).joined(separator: ", "))
+      if updateColumns.isEmpty {
+        query.append(") ON CONFLICT(\(quote: T.primaryKey.name)) DO NOTHING")
+        return query
+      }
       query.append(") ON CONFLICT(\(quote: T.primaryKey.name)) DO UPDATE SET ")
       query.append(" ")
       query.append(
-        nonPrimaryKeyChangedColumns
-          .map { columnName in
-            if let asset = record[columnName] as? CKAsset {
-              let data = try? asset.fileURL.map { try dataManager.wrappedValue.load($0) }
-              if data == nil {
-                reportIssue("Asset data not found on disk")
-              }
-              return
-                "\(quote: columnName) = \(data?.queryFragment ?? #""excluded".\#(quote: columnName)"#)"
-            } else {
-              return """
-                \(quote: columnName) = \
-                \(record.encryptedValues[columnName]?.queryFragment ?? #""excluded".\#(quote: columnName)"#)
-                """
-            }
-          }
+        updateColumns
+          .map { "\(quote: $0.name) = \($0.value)" }
           .joined(separator: ",")
       )
       return query
@@ -2506,36 +2500,59 @@
     }
   }
 
+  /// The value to write for `columnName`, or `nil` when the record carries an asset whose bytes
+  /// cannot be read.
+  ///
+  /// Callers drop such a column from the statement rather than writing `NULL` for it. Schemas that
+  /// follow the CloudKit guidance declare columns `NOT NULL ON CONFLICT REPLACE DEFAULT ...`, and
+  /// SQLite applies that substitution before `excluded` is materialized, so a `NULL` here does not
+  /// fail the write - it silently replaces good local data with the column's default.
+  ///
+  /// Only assets are treated this way. A non-asset column that is set but carries no value was
+  /// genuinely set to `NULL` by the sender, which is a change worth applying.
+  @available(iOS 17, macOS 14, tvOS 17, watchOS 10, *)
+  private func writableValue(
+    of record: CKRecord,
+    forColumn columnName: String,
+    dataManager: any DataManager
+  ) -> QueryFragment? {
+    guard let asset = record[columnName] as? CKAsset
+    else { return record.encryptedValues[columnName]?.queryFragment ?? "NULL" }
+    guard let data = try? asset.fileURL.map({ try dataManager.load($0) })
+    else {
+      reportIssue("Asset data not found on disk for '\(columnName)'. Keeping the local value.")
+      return nil
+    }
+    return data.queryFragment
+  }
+
   @available(iOS 17, macOS 14, tvOS 17, watchOS 10, *)
   private func upsert<T>(
     _: some SynchronizableTable<T>,
     record: CKRecord,
     columnNames: some Collection<String>
   ) -> QueryFragment {
-    let setColumnNames = T.TableColumns.writableColumns.map(\.name)
+    @Dependency(\.dataManager) var dataManager
+    // Resolved up front so a column whose asset cannot be read is left out of the statement
+    // entirely, rather than written as NULL. See `writableValue(of:forColumn:dataManager:)`.
+    let setColumns: [(name: String, value: QueryFragment)] =
+      T.TableColumns.writableColumns.map(\.name)
       .filter { record.hasSet(key: $0) }
-    guard !setColumnNames.isEmpty
+      .compactMap { columnName in
+        writableValue(of: record, forColumn: columnName, dataManager: dataManager)
+          .map { (name: columnName, value: $0) }
+      }
+    guard !setColumns.isEmpty
     else {
       return ""
     }
+    let setColumnNames = setColumns.map(\.name)
     let columnNames = columnNames.filter { setColumnNames.contains($0) }
     let hasNonPrimaryKeyColumns = columnNames.contains { $0 != T.primaryKey.name }
     var query: QueryFragment = "INSERT INTO \(T.self) ("
     query.append(setColumnNames.map { "\(quote: $0)" }.joined(separator: ", "))
     query.append(") VALUES (")
-    query.append(
-      setColumnNames
-        .map { columnName in
-          if let asset = record[columnName] as? CKAsset {
-            @Dependency(\.dataManager) var dataManager
-            return (try? asset.fileURL.map { try dataManager.load($0) })?
-              .queryFragment ?? "NULL"
-          } else {
-            return record.encryptedValues[columnName]?.queryFragment ?? "NULL"
-          }
-        }
-        .joined(separator: ", ")
-    )
+    query.append(setColumns.map(\.value).joined(separator: ", "))
     query.append(") ON CONFLICT(\(quote: T.primaryKey.name)) DO")
     if hasNonPrimaryKeyColumns {
       query.append(" UPDATE SET ")
